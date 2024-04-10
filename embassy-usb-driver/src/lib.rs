@@ -229,11 +229,68 @@ pub trait Endpoint {
 
 /// OUT Endpoint trait.
 pub trait EndpointOut: Endpoint {
+    /// Read data from the endpoint.
+    ///
+    /// This attempts to read data up to the full provided buffer length, or until the end of the
+    /// current transfer.
+    ///
+    /// - If the host sends a short packet, this signifies the end of the current transfer.  This
+    ///   will cause the read call to complete and return the data that was read, even if there is
+    ///   more space available in the supplied buffer.
+    ///
+    /// - If the buffer length is not an even multiple of the endpoint's maximum packet size,
+    ///   and the transfer contains more data than you have requested to read, a BufferOverflow
+    ///   error will be returned.  This behavior is useful when you know the exact size of the
+    ///   expected transfer, and want to fail if the host sends an unexpected amount.  This allows
+    ///   you to avoid allocating a larger size buffer than needed for reading the data.
+    ///
+    /// - If the buffer length is an even multiple of the endpoint's maximum size, and it fills up
+    ///   before the end of the transaction is reached, the read() call will complete successfully
+    ///   when the buffer has been filled.  You can then call read() again to continue reading more
+    ///   data from the transfer.  This allows you to perform a large transfer in multiple separate
+    ///   chunks, without requiring a buffer large enough to hold the full transfer.
+    ///
+    /// read() may return 0 bytes if the host sends a 0 length packet.
+    ///
+    /// Note: if you abandon a read() call before it completes (for instance, due to a timeout),
+    /// some read data may be lost.  Some data may have already been read into your buffer, but you
+    /// have no way to determine how much data was read if the operation is abandoned.
+    /// Additionally, some data may have already been read data into hardware buffers that has not
+    /// yet been processed by a call to poll(), and this data will need to be dropped if the read
+    /// is abandoned and there is no longer a CPU buffer available to hold the data.
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError>;
+}
+
+/// A helper trait for implementations that only support reading a single packet at a time.
+///
+/// EndpointInSinglePacket will convert larger read() calls into multiple serial calls to
+/// read_one_packet().
+pub trait EndpointOutSinglePacket: Endpoint {
     /// Read a single packet of data from the endpoint, and return the actual length of
     /// the packet.
     ///
-    /// This should also clear any NAK flags and prepare the endpoint to receive the next packet.
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError>;
+    /// If the length of buf is less than the endpoint's maximum packet size and the host sends a
+    /// packet larger than the buffer length, a BufferOverflow error should be returned.
+    async fn read_one_packet(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError>;
+}
+
+impl<EndpointSP: EndpointOutSinglePacket> EndpointOut for EndpointSP {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
+        if buf.len() == 0 {
+            self.read_one_packet(buf).await
+        } else {
+            let mut bytes_read: usize = 0;
+            let mps = self.info().max_packet_size as usize;
+            for pkt in buf.chunks_mut(mps) {
+                let pkt_len = self.read_one_packet(pkt).await?;
+                bytes_read += pkt_len;
+                if pkt_len < mps {
+                    break;
+                }
+            }
+            Ok(bytes_read)
+        }
+    }
 }
 
 /// USB control pipe trait.

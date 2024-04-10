@@ -1112,8 +1112,8 @@ impl<'d, T: Instance> embassy_usb_driver::Endpoint for Endpoint<'d, T, Out> {
     }
 }
 
-impl<'d, T: Instance> embassy_usb_driver::EndpointOut for Endpoint<'d, T, Out> {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
+impl<'d, T: Instance> embassy_usb_driver::EndpointOutSinglePacket for Endpoint<'d, T, Out> {
+    async fn read_one_packet(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
         trace!("read start len={}", buf.len());
 
         poll_fn(|cx| {

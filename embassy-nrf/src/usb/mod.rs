@@ -586,8 +586,8 @@ unsafe fn write_dma<T: Instance>(i: usize, buf: &[u8]) {
     dma_end();
 }
 
-impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
+impl<'d, T: Instance> driver::EndpointOutSinglePacket for Endpoint<'d, T, Out> {
+    async fn read_one_packet(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
         let i = self.info.addr.index();
         assert!(i != 0);
 

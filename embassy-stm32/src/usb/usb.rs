@@ -725,8 +725,8 @@ impl<'d, T: Instance> driver::Endpoint for Endpoint<'d, T, Out> {
     }
 }
 
-impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
+impl<'d, T: Instance> driver::EndpointOutSinglePacket for Endpoint<'d, T, Out> {
+    async fn read_one_packet(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
         trace!("READ WAITING, buf.len() = {}", buf.len());
         let index = self.info.addr.index();
         let stat = poll_fn(|cx| {
