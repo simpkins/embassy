@@ -51,15 +51,6 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     assert!(len == 8, "invalid SETUP packet length={}", len);
                     assert!(ep_num == 0, "invalid SETUP packet endpoint={}", ep_num);
 
-                    // flushing TX if something stuck in control endpoint
-                    if r.dieptsiz(ep_num).read().pktcnt() != 0 {
-                        r.grstctl().modify(|w| {
-                            w.set_txfnum(ep_num as _);
-                            w.set_txfflsh(true);
-                        });
-                        while r.grstctl().read().txfflsh() {}
-                    }
-
                     if state.ep0_setup_ready.load(Ordering::Relaxed) == false {
                         // SAFETY: exclusive access ensured by atomic bool
                         let data = unsafe { &mut *state.ep0_setup_data.get() };
@@ -1167,76 +1158,128 @@ impl<'d, T: Instance> embassy_usb_driver::EndpointOut for Endpoint<'d, T, Out> {
     }
 }
 
-// The Synopsis USB core does support issuing larger writes.  We should take advantage of
-// this in the future, but for now just do a simple one-packet-at-a-time implementation.
-impl<'d, T: Instance> embassy_usb_driver::EndpointInSinglePacket for Endpoint<'d, T, In> {
-    async fn write_packet(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
+impl<'d, T: Instance> embassy_usb_driver::EndpointInZLP for Endpoint<'d, T, In> {
+    async fn write_no_zlp(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
         trace!("write ep={:?} data={:?}", self.info.addr, buf);
 
-        if buf.len() > self.info.max_packet_size as usize {
-            return Err(EndpointError::BufferOverflow);
+        let index = self.info.addr.index();
+        let mut guard = WriteGuard::<T>::new(index);
+
+        // Wait until any previous write operation has completed.
+        //
+        // There can't be two write() calls running simultaneously, but the previous write() call
+        // may have returned before the transfer was complete.  write() only waits until all data
+        // was written to the TX FIFO, but does not wait until the transfer completes.  We need to
+        // wait for any previous transfer to finish before we can start a new one.
+        self.wait_for_write_idle().await?;
+
+        // Start the hardware write transfer
+        let xfer_len = self.start_next_write_xfer(buf.len())?;
+        if xfer_len == 0 {
+            // If this was a 0-length write, we are all done.
+            guard.mark_complete();
+            return Ok(());
         }
 
+        // Loop writing all of the data to the TX FIFO,
+        // and issuing more hardware transfers if necessary.
+        let mut bytes_written = 0;
+        let mut xfer_end = xfer_len;
+        loop {
+            // Write more data to the FIFO
+            bytes_written += self.write_to_fifo(&buf[bytes_written..xfer_end]);
+            if bytes_written < xfer_len {
+                self.wait_for_tx_fifo_space().await?;
+                continue;
+            }
+
+            // We finished writing data to the TX FIFO for this hw transfer.
+            if bytes_written == buf.len() {
+                // We have written all the data.
+                // We don't need to wait for the final transfer to complete.  We can return
+                // immediately now that we have put all the data in the TX FIFO and no longer need
+                // the caller's buffer.
+                guard.mark_complete();
+                return Ok(());
+            }
+            // Wait for the current hardware transfer to finish
+            self.wait_for_write_idle().await?;
+
+            // We finished writing the data for this hardware transfer, but this wasn't the end of
+            // the caller's buffer and we need to start another hw transfer.
+            let xfer_len = self.start_next_write_xfer(buf.len())?;
+            xfer_end = bytes_written + xfer_len;
+        }
+    }
+}
+
+impl<'d, T: Instance> Endpoint<'d, T, In> {
+    async fn wait_for_write_idle(&mut self) -> Result<(), EndpointError> {
         let r = T::regs();
         let index = self.info.addr.index();
         let state = T::state();
 
-        // Wait for previous transfer to complete and check if endpoint is disabled
         poll_fn(|cx| {
             state.ep_in_wakers[index].register(cx.waker());
 
             let diepctl = r.diepctl(index).read();
-            let dtxfsts = r.dtxfsts(index).read();
-            trace!(
-                "write ep={:?}: diepctl {:08x} ftxfsts {:08x}",
-                self.info.addr,
-                diepctl.0,
-                dtxfsts.0
-            );
-            if !diepctl.usbaep() {
-                trace!("write ep={:?} wait for prev: error disabled", self.info.addr);
-                Poll::Ready(Err(EndpointError::Disabled))
-            } else if !diepctl.epena() {
-                trace!("write ep={:?} wait for prev: ready", self.info.addr);
-                Poll::Ready(Ok(()))
-            } else {
-                trace!("write ep={:?} wait for prev: pending", self.info.addr);
-                Poll::Pending
+            if !self.is_write_valid(diepctl) {
+                return Poll::Ready(Err(EndpointError::Disabled));
             }
+
+            // If a transfer is still in progress, wait for it to complete.
+            // The xfrcm interrupt will wake us up.
+            if diepctl.epena() {
+                trace!("write ep={:?} wait for prev: pending", self.info.addr);
+                return Poll::Pending;
+            }
+
+            Poll::Ready(Ok(()))
         })
-        .await?;
+        .await
+    }
 
-        if buf.len() > 0 {
-            poll_fn(|cx| {
-                state.ep_in_wakers[index].register(cx.waker());
+    /// Start another hardware transfer.
+    ///
+    /// This determines how much data we can send in a single hardware transfer,
+    /// asks the hardware to start this transfer, and returns the transfer length.
+    /// The caller must write the data to the TX FIFO after this method returns.
+    fn start_next_write_xfer(&mut self, data_len: usize) -> Result<usize, EndpointError> {
+        let r = T::regs();
+        let index = self.info.addr.index();
 
-                let size_words = (buf.len() + 3) / 4;
+        // Determine how much data we can send in a single hardware transfer
+        let (pkt_count, xfer_size) = if data_len == 0 {
+            (1, 0)
+        } else {
+            let (max_packets, max_size) = if index == 0 {
+                // Endpoint 0 can only write up to 3 packets at a time, and up to 127 bytes.
+                (3, 0x7f)
+            } else {
+                // Other endpoints have substantially larger limits
+                (0x3ff, 0x7ffff)
+            };
 
-                let fifo_space = r.dtxfsts(index).read().ineptfsav() as usize;
-                if size_words > fifo_space {
-                    // Not enough space in fifo, enable tx fifo empty interrupt
-                    critical_section::with(|_| {
-                        r.diepempmsk().modify(|w| {
-                            w.set_ineptxfem(w.ineptxfem() | (1 << index));
-                        });
-                    });
+            // Choose the smaller of max_size and (max_packets * max_packet_size)
+            let mps = self.info.max_packet_size as usize;
+            let max_size = max_size.min(max_packets * mps);
+            let xfer_size = max_size.min(data_len);
 
-                    trace!("tx fifo for ep={} full, waiting for txfe", index);
+            let pkt_count = (xfer_size + (mps - 1)) / mps;
+            (pkt_count, xfer_size)
+        };
 
-                    Poll::Pending
-                } else {
-                    trace!("write ep={:?} wait for fifo: ready", self.info.addr);
-                    Poll::Ready(())
-                }
-            })
-            .await
-        }
+        trace!(
+            "write ep={:?} start transfer of {} packets, {} bytes",
+            self.info.addr,
+            pkt_count,
+            xfer_size
+        );
 
-        // Setup transfer size
-        r.dieptsiz(index).write(|w| {
-            w.set_mcnt(1);
-            w.set_pktcnt(1);
-            w.set_xfrsiz(buf.len() as _);
+        // Start the transfer
+        r.dieptsiz(index).modify(|w| {
+            w.set_pktcnt(pkt_count as u16);
+            w.set_xfrsiz(xfer_size as u32);
         });
 
         critical_section::with(|_| {
@@ -1247,16 +1290,184 @@ impl<'d, T: Instance> embassy_usb_driver::EndpointInSinglePacket for Endpoint<'d
             });
         });
 
-        // Write data to FIFO
-        for chunk in buf.chunks(4) {
+        Ok(xfer_size)
+    }
+
+    /// Write as much data to the TX FIFO as possible
+    fn write_to_fifo(&mut self, buf: &[u8]) -> usize {
+        let r = T::regs();
+        let index = self.info.addr.index();
+        // Currently we always assign TX FIFO N to endpoint N.
+        let fifo_number = index;
+
+        // Determine how much we can write at the moment
+        let fifo_space = r.dtxfsts(index).read().ineptfsav() as usize;
+        let num_bytes = buf.len().min(fifo_space * 4);
+
+        trace!("write ep={:?}: writing {} bytes to FIFO", self.info.addr, num_bytes);
+
+        // TODO: maybe it would be more efficient to just use bytemuck::cast() for all but the last
+        // partial word?
+        let slice = &buf[..num_bytes];
+        for chunk in slice.chunks(4) {
             let mut tmp = [0u8; 4];
             tmp[0..chunk.len()].copy_from_slice(chunk);
-            r.fifo(index).write_value(regs::Fifo(u32::from_ne_bytes(tmp)));
+            r.fifo(fifo_number).write_value(regs::Fifo(u32::from_ne_bytes(tmp)));
         }
 
-        trace!("write done ep={:?}", self.info.addr);
+        num_bytes
+    }
 
-        Ok(())
+    async fn wait_for_tx_fifo_space(&mut self) -> Result<(), EndpointError> {
+        let r = T::regs();
+        let state = T::state();
+        let index = self.info.addr.index();
+
+        poll_fn(|cx| {
+            state.ep_in_wakers[index].register(cx.waker());
+
+            let diepctl = r.diepctl(index).read();
+            if !self.is_write_valid(diepctl) {
+                return Poll::Ready(Err(EndpointError::Disabled));
+            }
+
+            // Return once we have room to write more data.
+            let fifo_space = r.dtxfsts(index).read().ineptfsav() as usize;
+            if fifo_space > 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            // Enable the TX FIFO empty interrupt, and wait for it to fire.
+            critical_section::with(|_| {
+                r.diepempmsk().modify(|w| {
+                    w.set_ineptxfem(w.ineptxfem() | (1 << index));
+                });
+            });
+            Poll::Pending
+        })
+        .await
+    }
+
+    fn is_write_valid(&self, diepctl: regs::Diepctl) -> bool {
+        // If the endpoint has been disabled, fail the write.
+        // This can happen if a bus reset occurs while we are waiting to write.
+        if !diepctl.usbaep() {
+            trace!("write ep={:?} waiting: error disabled", self.info.addr);
+            return false;
+        }
+
+        // If this is endpoint 0 and a SETUP packet has arrived, fail the write.  This
+        // presumably means we have gotten out of sync with the host somehow and it is not
+        // expecting our IN transfer.
+        //
+        // e.g.: at the moment I suspect this could happen if the host retransmits a SETUP
+        // packet, since we process setup packets immediately when we see SETUP_DATA_RX in the
+        // RX FIFO, and don't wait for the setup complete interrupt in doepint.  We perhaps
+        // should wait until the setup complete interrupt, as recommended in the STMicro docs.
+        let index = self.info.addr.index();
+        let state = T::state();
+        if index == 0 && state.ep0_setup_ready.load(Ordering::Relaxed) {
+            trace!("write ep={:?} waiting: unexpected SETUP packet", self.info.addr);
+            return false;
+        }
+
+        true
+    }
+}
+
+/// A WriteGuard exists for the duration of an in-progress write attempt.
+///
+/// This exists solely to help abort the write transfer if the caller abandons a write() call.
+struct WriteGuard<T: Instance> {
+    ep_index: usize,
+    complete: bool,
+    _data: PhantomData<T>,
+}
+
+impl<T: Instance> WriteGuard<T> {
+    fn new(ep_index: usize) -> Self {
+        Self {
+            ep_index,
+            complete: false,
+            _data: PhantomData,
+        }
+    }
+
+    fn mark_complete(&mut self) {
+        self.complete = true;
+    }
+}
+
+impl<T: Instance> Drop for WriteGuard<T> {
+    fn drop(&mut self) {
+        if self.complete {
+            // Don't need to abort anything if we are returning successfully.
+            return;
+        }
+
+        trace!("write EP{}: aborting dropped write", self.ep_index);
+        let r = T::regs();
+        if !r.diepctl(self.ep_index).read().epena() {
+            // Quit early if the transfer is already done.
+            return;
+        }
+
+        // This is following the instructions for aborting a write from the STM32F411 reference
+        // manual.  See section 22.17.6, "IN endpoint disable".
+        //
+        // The documentation for the diepctl.epdis field specifies "The application must set
+        // this bit only if Endpoint enable is already set for this endpoint."  Since the USB
+        // peripheral may clear the epena flag while it is writing, enabling the NAK flag is
+        // presumably done to ensure that the USB peripheral does not clear epena while we are
+        // trying to set epdis.
+        //
+        // It is unfortunate that this requires busy looping, particularly with critical sections.
+        // TODO: We possibly could avoid this by just recording in State that this endpoint needs
+        // to be flushed, and then flush it the next time we get a chance in Bus::poll() or the
+        // next time an Endpoint method is called.
+        //
+        // 1. Wait for AHB idle
+        while !r.grstctl().read().ahbidl() {}
+
+        // This critical section guards our modifications to diepctl and grstctl.
+        // Note that other parts of the code currently modify grstctl without a critical section
+        // (e.g., init_fifo() acn attempt to flush TX FIFOs without a critical section.  It
+        // seems like we probably should also use critical sections there?)
+        critical_section::with(|_| {
+            // 2. Set the NAK flag
+            r.diepctl(self.ep_index).modify(|w| w.set_snak(true));
+
+            // 3. Wait for the NAK to take effect.
+            while !r.diepint(self.ep_index).read().inepne() {}
+
+            // If the endpoint is no longer enabled, we can go ahead and quit now.
+            if !r.diepctl(self.ep_index).read().epena() {
+                return;
+            }
+
+            // 4. Set the EPDIS and SNAK flags.
+            r.diepctl(self.ep_index).modify(|w| {
+                w.set_epdis(true);
+                w.set_snak(true);
+            });
+
+            // 5. Wait for the disable to take effect.
+            while !r.diepint(self.ep_index).read().epdisd() {}
+
+            // 6. Read dieptsiz to determine how much data was written before the transfer was aborted.
+            // (We don't bother with this step, since there is nothing we can do with that
+            // information.)
+            //
+            // 7. Flush any remaining data in the TX FIFO.
+            // Currently we always assign TX FIFO N to endpoint N.
+            let fifo_number = self.ep_index as u8;
+            r.grstctl().modify(|w| {
+                w.set_txfnum(fifo_number);
+                w.set_txfflsh(true);
+            });
+            // Wait for the flush to complete
+            while r.grstctl().read().txfflsh() {}
+        });
     }
 }
 
