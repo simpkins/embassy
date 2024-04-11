@@ -301,6 +301,22 @@ impl<'d, D: Driver<'d>> CdcAcmClass<'d, D> {
         self.control.rts.load(Ordering::Relaxed)
     }
 
+    /// Writes data into the IN endpoint.
+    ///
+    /// If the data you send is an exact multiple of the endpoint's maximum packet size,
+    /// this will explicitly indicate the end of the transfer by sending a zero-length packet.
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), EndpointError> {
+        self.write_ep.write_data(data, true).await
+    }
+
+    /// Writes data into the IN endpoint.
+    ///
+    /// This is similar to write(), but does not send a final zero-length packet even if your data
+    /// is a multiple of the maximum packet length.
+    pub async fn write_no_flush(&mut self, data: &[u8]) -> Result<(), EndpointError> {
+        self.write_ep.write_data(data, false).await
+    }
+
     /// Writes a single packet into the IN endpoint.
     pub async fn write_packet(&mut self, data: &[u8]) -> Result<(), EndpointError> {
         self.write_ep.write(data).await
